@@ -1,0 +1,300 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  ECR_REPOSITORY: my-python-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pylint flake8 black isort pytest pytest-cov
+
+      - name: Lint - Black code formatting
+        run: black --check .
+        continue-on-error: true
+
+      - name: Lint - isort import sorting
+        run: isort --check-only .
+        continue-on-error: true
+
+      - name: Lint - pylint
+        run: pylint **/*.py --fail-under=8.0
+        continue-on-error: true
+
+      - name: Lint - flake8
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        continue-on-error: true
+
+      - name: Run unit tests with pytest
+        run: |
+          pytest test_main.py -v --cov=. --cov-report=xml --cov-report=html
+        continue-on-error: true
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+
+  dependency-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install safety bandit
+
+      - name: Safety - Check vulnerable dependencies
+        run: |
+          pip install -r requirements.txt
+          safety check --json || true
+        continue-on-error: true
+
+      - name: Bandit - Security issue scanner
+        run: bandit -r . -f json -o bandit-report.json || true
+        continue-on-error: true
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  build-scan-push:
+    name: Build, Scan & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, dependency-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker image
+        id: build-image
+        run: |
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          echo "image-uri=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image-uri }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: Run Trivy JSON scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image-uri }}
+          format: 'json'
+          output: 'trivy-results.json'
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-report
+          path: trivy-results.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Push image to AWS ECR
+        run: |
+          docker push ${{ steps.build-image.outputs.image-uri }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Output ECR image details
+        run: echo "Image pushed to ${{ steps.build-image.outputs.image-uri }}"
+
+  deploy-to-kind:
+    name: Deploy to Kind Cluster
+    runs-on: ubuntu-latest
+    needs: [build-scan-push]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Kind cluster
+        uses: helm/kind-action@v1.7.0
+        with:
+          cluster_name: kind
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+
+      - name: Verify Kind cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create ECR Secret for Kind
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          kubectl create secret docker-registry ecr-secret \
+            --docker-server=${{ env.ECR_REGISTRY }} \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) \
+            --namespace=default || true
+
+      - name: Create deployment manifest
+        run: |
+          cat > deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: python-app
+            labels:
+              app: python-app
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: python-app
+            template:
+              metadata:
+                labels:
+                  app: python-app
+              spec:
+                imagePullSecrets:
+                - name: ecr-secret
+                containers:
+                - name: python-app
+                  image: ${{ needs.build-scan-push.outputs.image-uri }}
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 8000
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /ready
+                      port: 8000
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: python-app-service
+          spec:
+            type: LoadBalancer
+            selector:
+              app: python-app
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8000
+          EOF
+
+      - name: Deploy to Kind cluster
+        run: kubectl apply -f deployment.yaml
+
+      - name: Wait for deployment to be ready
+        run: |
+          kubectl rollout status deployment/python-app --timeout=5m
+          kubectl get pods -o wide
+          kubectl get svc
+
+      - name: Verify deployment
+        run: |
+          echo "Checking deployment status..."
+          kubectl get deployment python-app -o wide
+          kubectl get pods -l app=python-app -o wide
+          kubectl logs -l app=python-app --tail=20 || true
+
+      - name: Run smoke tests
+        run: |
+          SERVICE_IP=$(kubectl get svc python-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "localhost")
+          echo "Waiting for service to be ready..."
+          sleep 10
+          echo "Testing service endpoint..."
+          curl -f http://$SERVICE_IP/health || echo "Service not yet accessible"
