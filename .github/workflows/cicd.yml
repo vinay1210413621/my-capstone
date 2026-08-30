@@ -9,6 +9,17 @@ on:
     branches:
       - main
       - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
 
 env:
   AWS_REGION: us-east-1
@@ -114,6 +125,30 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Validate AWS Secrets
+        run: |
+          if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+            echo "❌ ERROR: AWS_ACCOUNT_ID secret is not set"
+            echo "Please add AWS_ACCOUNT_ID to GitHub repository secrets"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_REGION }}" ]; then
+            echo "❌ ERROR: AWS_REGION secret is not set"
+            echo "Please add AWS_REGION to GitHub repository secrets"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "❌ ERROR: AWS_ACCESS_KEY_ID secret is not set"
+            echo "Please add AWS_ACCESS_KEY_ID to GitHub repository secrets"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ ERROR: AWS_SECRET_ACCESS_KEY secret is not set"
+            echo "Please add AWS_SECRET_ACCESS_KEY to GitHub repository secrets"
+            exit 1
+          fi
+          echo "✅ All AWS secrets are configured correctly"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
