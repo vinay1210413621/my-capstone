@@ -251,6 +251,22 @@ jobs:
             --docker-username=AWS \
             --docker-password=$(aws ecr get-login-password --region ${{ vars.AWS_REGION }}) \
             --namespace=default || true
+      
+      - name: Test ECR access
+        run: |
+          echo "AWS identity:"
+          aws sts get-caller-identity
+
+          echo "Checking ECR repository:"
+          aws ecr describe-repositories \
+            --repository-names "${ECR_REPOSITORY}" \
+            --region "${AWS_REGION}"
+
+          echo "Checking image:"
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}"
             
       - name: Check image URI
         run: |
