@@ -254,11 +254,12 @@ jobs:
             
       - name: Check image URI
         run: |
-          echo "IMAGE URI = '${{ needs.build-scan-push.outputs.image-uri }}'"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          #echo "IMAGE URI = '${{ needs.build-scan-push.outputs.image-uri }}'"
 
       - name: Create deployment manifest
         env:
-          IMAGE_URI: ${{ needs.build-scan-push.outputs.image-uri }}
+          IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           cat > deployment.yaml <<EOF
           apiVersion: apps/v1
