@@ -158,10 +158,13 @@ jobs:
 
       - name: Build Docker image
         id: build-image
+        env:
+          FULL_IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
-          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
-          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
-          echo "image-uri=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+          docker build -t $FULL_IMAGE_URI .
+          docker tag $FULL_IMAGE_URI ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          echo "image-uri=$FULL_IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built image: $FULL_IMAGE_URI"
 
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
@@ -315,6 +318,9 @@ jobs:
               port: 80
               targetPort: 8000
           EOF
+      
+      - name: Debug - Show deployment manifest
+        run: cat deployment.yaml
 
       - name: Deploy to Kind cluster
         run: kubectl apply -f deployment.yaml
@@ -330,7 +336,12 @@ jobs:
           echo "Checking deployment status..."
           kubectl get deployment python-app -o wide
           kubectl get pods -l app=python-app -o wide
-          kubectl logs -l app=python-app --tail=20 || true
+          echo "=== Pod Events ==="
+          kubectl describe pod -l app=python-app || true
+          echo "=== Pod Logs ==="
+          kubectl logs -l app=python-app --tail=30 || true
+          echo "=== Events ==="
+          kubectl get events --sort-by=.lastTimestamp
 
       - name: Run smoke tests
         run: |
