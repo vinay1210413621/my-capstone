@@ -260,7 +260,7 @@ jobs:
         env:
           IMAGE_URI: ${{ needs.build-scan-push.outputs.image-uri }}
         run: |
-          cat > deployment.yaml <<'EOF'
+          cat > deployment.yaml <<EOF
           apiVersion: apps/v1
           kind: Deployment
           metadata:
