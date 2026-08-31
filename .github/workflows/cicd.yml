@@ -248,10 +248,16 @@ jobs:
             --docker-username=AWS \
             --docker-password=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) \
             --namespace=default || true
+            
+      - name: Check image URI
+        run: |
+          echo "IMAGE URI = '${{ needs.build-scan-push.outputs.image-uri }}'"
 
       - name: Create deployment manifest
+        env:
+          IMAGE_URI: ${{ needs.build-scan-push.outputs.image-uri }}
         run: |
-          cat > deployment.yaml <<EOF
+          cat > deployment.yaml <<'EOF'
           apiVersion: apps/v1
           kind: Deployment
           metadata:
@@ -272,7 +278,7 @@ jobs:
                 - name: ecr-secret
                 containers:
                 - name: python-app
-                  image: ${{ needs.build-scan-push.outputs.image-uri }}
+                  image: ${IMAGE_URI}
                   imagePullPolicy: Always
                   ports:
                   - containerPort: 8000
