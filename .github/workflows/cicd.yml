@@ -345,6 +345,10 @@ jobs:
 
       - name: Run smoke tests
         run: |
+          kubectl get pods -o wide
+          kubectl get svc
+          kubectl get deployment python-app -o wide
+          kubectl logs -l app=python-app --tail=30 || true
           SERVICE_IP=$(kubectl get svc python-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "localhost")
           echo "Waiting for service to be ready..."
           sleep 10
