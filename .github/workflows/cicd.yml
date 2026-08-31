@@ -256,6 +256,7 @@ jobs:
         run: |
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           #echo "IMAGE URI = '${{ needs.build-scan-push.outputs.image-uri }}'"
+          echo "IMAGE URI = '$IMAGE_URI'"
 
       - name: Create deployment manifest
         env:
