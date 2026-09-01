@@ -267,7 +267,7 @@ jobs:
             --repository-name "${ECR_REPOSITORY}" \
             --image-ids imageTag="${IMAGE_TAG}" \
             --region "${AWS_REGION}"
-            
+
       - name: Check image URI
         run: |
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
@@ -328,13 +328,14 @@ jobs:
           metadata:
             name: python-app-service
           spec:
-            type: LoadBalancer
+            type: NodePort
             selector:
               app: python-app
             ports:
             - protocol: TCP
               port: 80
               targetPort: 8000
+              nodePort: 30080
           EOF
       
       - name: Debug - Show deployment manifest
@@ -369,8 +370,25 @@ jobs:
           kubectl get secret ecr-secret
           kubectl get secret ecr-secret -o jsonpath='{.type}'
           kubectl describe pod -l app=python-app || true
-          SERVICE_IP=$(kubectl get svc python-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "localhost")
-          echo "Waiting for service to be ready..."
-          sleep 10
-          echo "Testing service endpoint..."
-          curl -f http://$SERVICE_IP/health || echo "Service not yet accessible"
+          echo "Waiting for deployment..."
+          kubectl wait --for=condition=available deployment/python-app --timeout=120s
+
+          echo "Starting port-forward..."
+          kubectl port-forward svc/python-app-service 8080:80 > /tmp/port-forward.log 2>&1 &
+          PORT_FORWARD_PID=$!
+          echo "Port-forward PID: $PORT_FORWARD_PID"
+
+          # Give port-forward a moment to establish
+          sleep 3
+
+          echo "Testing /health..."
+          curl -f http://localhost:8080/health
+
+          echo
+          echo "Testing /ready..."
+          curl -f http://localhost:8080/ready
+
+          echo
+          echo "Smoke tests passed!"
+
+          kill $PORT_FORWARD_PID
