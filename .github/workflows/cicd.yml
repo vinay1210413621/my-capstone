@@ -20,6 +20,14 @@ on:
           - development
           - staging
           - production
+      deployment-target:
+        description: 'Deployment target cluster'
+        required: false
+        default: 'kind'
+        type: choice
+        options:
+          - kind
+          - ecs
 permissions:
   contents: read
   security-events: write
@@ -82,6 +90,33 @@ jobs:
             coverage.xml
             htmlcov/
 
+  gitleaks-scan:
+    name: GitLeaks Secrets Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        id: gitleaks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Gitleaks summary
+        if: always()
+        run: |
+          if [ "${{ steps.gitleaks.outcome }}" = "failure" ]; then
+            echo "⚠️  WARNING: Potential secrets detected by gitleaks"
+            echo "Review the gitleaks report above for details"
+          else
+            echo "✅ Gitleaks scan passed - no secrets detected"
+          fi
+
   dependency-scan:
     name: Dependency Scan
     runs-on: ubuntu-latest
@@ -120,7 +155,7 @@ jobs:
   build-scan-push:
     name: Build, Scan & Push to ECR
     runs-on: ubuntu-latest
-    needs: [dependency-scan]
+    needs: [dependency-scan, gitleaks-scan]
     if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch' }}
     outputs:
       image-uri: ${{ steps.build-image.outputs.image-uri }}
@@ -218,7 +253,7 @@ jobs:
     name: Deploy to Kind Cluster
     runs-on: ubuntu-latest
     needs: [build-scan-push]
-    if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch' }}
+    if: ${{ ((github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.deployment-target == 'kind' || github.event.inputs.deployment-target == ''))) }}
     
     steps:
       - name: Checkout code
@@ -389,6 +424,208 @@ jobs:
           curl -f http://localhost:8080/ready
 
           echo
-          echo "Smoke tests passed!"
+          echo "✅ Smoke tests passed!"
 
-          kill $PORT_FORWARD_PID
+          kill $PORT_FORWARD_PID || true
+
+  deploy-to-ecs:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: [build-scan-push]
+    if: ${{ ((github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch') && github.event.inputs.deployment-target == 'ecs' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Get ECS task definition
+        run: |
+          TASK_DEFINITION="python-app-task"
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEFINITION \
+            --region ${{ vars.AWS_REGION }} > task-def.json || echo "Task definition not found, will create new one"
+
+      - name: Create or update ECS task definition
+        env:
+          CONTAINER_NAME: python-app
+          IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          TASK_ROLE_ARN="${{ secrets.ECS_TASK_ROLE_ARN }}"
+          EXECUTION_ROLE_ARN="${{ secrets.ECS_EXECUTION_ROLE_ARN }}"
+          
+          # Use existing task role or fallback
+          TASK_ROLE_ARN=${TASK_ROLE_ARN:-"arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsTaskRole"}
+          EXECUTION_ROLE_ARN=${EXECUTION_ROLE_ARN:-"arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole"}
+          
+          cat > task-definition.json <<EOF
+          {
+            "family": "python-app-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [
+              {
+                "name": "$CONTAINER_NAME",
+                "image": "$IMAGE_URI",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/python-app",
+                    "awslogs-region": "${{ vars.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "environment": [
+                  {
+                    "name": "ENVIRONMENT",
+                    "value": "${{ github.event.inputs.environment || 'production' }}"
+                  }
+                ],
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ],
+            "taskRoleArn": "$TASK_ROLE_ARN",
+            "executionRoleArn": "$EXECUTION_ROLE_ARN"
+          }
+          EOF
+          
+          cat task-definition.json
+
+      - name: Register ECS task definition
+        run: |
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --region ${{ vars.AWS_REGION }}
+
+      - name: Get ECS cluster and service info
+        run: |
+          CLUSTER_NAME="python-app-cluster"
+          SERVICE_NAME="python-app-service"
+          
+          echo "Checking ECS cluster..."
+          aws ecs list-clusters --region ${{ vars.AWS_REGION }} || true
+          
+          echo "Checking ECS services..."
+          aws ecs list-services --cluster $CLUSTER_NAME --region ${{ vars.AWS_REGION }} || true
+
+      - name: Deploy to ECS
+        run: |
+          CLUSTER_NAME="python-app-cluster"
+          SERVICE_NAME="python-app-service"
+          TASK_DEFINITION="python-app-task"
+          
+          # Create cluster if it doesn't exist
+          aws ecs create-cluster \
+            --cluster-name $CLUSTER_NAME \
+            --region ${{ vars.AWS_REGION }} 2>/dev/null || echo "Cluster already exists"
+          
+          # Check if service exists
+          SERVICE_EXISTS=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ vars.AWS_REGION }} \
+            --query 'services[0].serviceName' \
+            --output text 2>/dev/null || echo "NONE")
+          
+          if [ "$SERVICE_EXISTS" = "NONE" ]; then
+            echo "Creating new ECS service..."
+            aws ecs create-service \
+              --cluster $CLUSTER_NAME \
+              --service-name $SERVICE_NAME \
+              --task-definition $TASK_DEFINITION \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[],assignPublicIp=ENABLED}" \
+              --region ${{ vars.AWS_REGION }}
+          else
+            echo "Updating existing ECS service..."
+            aws ecs update-service \
+              --cluster $CLUSTER_NAME \
+              --service $SERVICE_NAME \
+              --task-definition $TASK_DEFINITION \
+              --region ${{ vars.AWS_REGION }}
+          fi
+
+      - name: Wait for ECS deployment
+        run: |
+          CLUSTER_NAME="python-app-cluster"
+          SERVICE_NAME="python-app-service"
+          
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ vars.AWS_REGION }} || true
+          
+          echo "ECS deployment status:"
+          aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ vars.AWS_REGION }} \
+            --query 'services[0].[serviceName,status,runningCount,desiredCount]' \
+            --output table
+
+      - name: Verify deployment
+        run: |
+          CLUSTER_NAME="python-app-cluster"
+          SERVICE_NAME="python-app-service"
+          
+          echo "Service details:"
+          aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ vars.AWS_REGION }}
+          
+          echo "Task details:"
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster $CLUSTER_NAME \
+            --service-name $SERVICE_NAME \
+            --region ${{ vars.AWS_REGION }} \
+            --query 'taskArns[0]' \
+            --output text)
+          
+          if [ ! -z "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+            aws ecs describe-tasks \
+              --cluster $CLUSTER_NAME \
+              --tasks $TASK_ARN \
+              --region ${{ vars.AWS_REGION }}
+          else
+            echo "No tasks running yet"
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "✅ ECS deployment completed!"
+          echo ""
+          echo "📊 Summary:"
+          echo "  - Cluster: python-app-cluster"
+          echo "  - Service: python-app-service"
+          echo "  - Task Definition: python-app-task"
+          echo "  - Image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "  - Environment: ${{ github.event.inputs.environment || 'production' }}"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Verify service: aws ecs describe-services --cluster python-app-cluster --services python-app-service"
+          echo "  2. View logs: aws logs tail /ecs/python-app"
+          echo "  3. Scale: aws ecs update-service --cluster python-app-cluster --service python-app-service --desired-count N"
